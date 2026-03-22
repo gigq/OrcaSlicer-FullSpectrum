@@ -56,6 +56,17 @@ struct RGBf {
     return { to_u8(c.r), to_u8(c.g), to_u8(c.b) };
 }
 
+static double srgb_channel_to_linear(double srgb)
+{
+    return (srgb <= 0.04045) ? (srgb / 12.92) : std::pow((srgb + 0.055) / 1.055, 2.4);
+}
+
+static double linear_channel_to_srgb(double linear)
+{
+    const double clamped = std::clamp(linear, 0.0, 1.0);
+    return (clamped <= 0.0031308) ? (12.92 * clamped) : (1.055 * std::pow(clamped, 1.0 / 2.4) - 0.055);
+}
+
 
 // Convert RGB to an artist-pigment style RYB space.
 // This is an approximation, but it gives expected pair mixes:
@@ -1350,7 +1361,8 @@ const MixedFilament *MixedFilamentManager::mixed_filament_from_id(unsigned int f
     return idx >= 0 ? &m_mixed[size_t(idx)] : nullptr;
 }
 
-// Blend N colours using weighted pairwise FilamentMixer blending.
+// Blend N colours using a subtractive/transmittance-style approximation so
+// mixed filament previews better match imported color remaps.
 std::string MixedFilamentManager::blend_color_multi(
     const std::vector<std::pair<std::string, int>> &color_percents)
 {
@@ -1376,27 +1388,32 @@ std::string MixedFilamentManager::blend_color_multi(
     if (colors.empty() || total_pct <= 0)
         return "#000000";
 
-    unsigned char r = static_cast<unsigned char>(colors.front().color.r);
-    unsigned char g = static_cast<unsigned char>(colors.front().color.g);
-    unsigned char b = static_cast<unsigned char>(colors.front().color.b);
-    int accumulated_pct = colors.front().pct;
+    double r_absorbance = 0.0;
+    double g_absorbance = 0.0;
+    double b_absorbance = 0.0;
+    constexpr double k_min_channel = 1e-6;
 
-    for (size_t i = 1; i < colors.size(); ++i) {
-        const auto &next = colors[i];
-        const int new_total = accumulated_pct + next.pct;
-        if (new_total <= 0)
+    for (const auto &weighted : colors) {
+        const double weight = std::max(0, weighted.pct);
+        if (weight <= 0.0)
             continue;
-        const float t = static_cast<float>(next.pct) / static_cast<float>(new_total);
-        filament_mixer_lerp(
-            r, g, b,
-            static_cast<unsigned char>(next.color.r),
-            static_cast<unsigned char>(next.color.g),
-            static_cast<unsigned char>(next.color.b),
-            t, &r, &g, &b);
-        accumulated_pct = new_total;
+
+        r_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(weighted.color.r) / 255.0))) * weight;
+        g_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(weighted.color.g) / 255.0))) * weight;
+        b_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(weighted.color.b) / 255.0))) * weight;
     }
 
-    return rgb_to_hex({int(r), int(g), int(b)});
+    const auto to_u8 = [](double value) -> int {
+        return std::clamp(static_cast<int>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0)), 0, 255);
+    };
+
+    const double r_linear = std::exp(-r_absorbance / double(total_pct));
+    const double g_linear = std::exp(-g_absorbance / double(total_pct));
+    const double b_linear = std::exp(-b_absorbance / double(total_pct));
+
+    return rgb_to_hex({to_u8(linear_channel_to_srgb(r_linear)),
+                       to_u8(linear_channel_to_srgb(g_linear)),
+                       to_u8(linear_channel_to_srgb(b_linear))});
 }
 
 std::string MixedFilamentManager::blend_color(const std::string &color_a,
@@ -1405,24 +1422,7 @@ std::string MixedFilamentManager::blend_color(const std::string &color_a,
 {
     const int safe_a = std::max(0, ratio_a);
     const int safe_b = std::max(0, ratio_b);
-    const int total  = safe_a + safe_b;
-    const float t    = (total > 0) ? (static_cast<float>(safe_b) / static_cast<float>(total)) : 0.5f;
-
-    const RGB rgb_a = parse_hex_color(color_a);
-    const RGB rgb_b = parse_hex_color(color_b);
-
-    unsigned char out_r = static_cast<unsigned char>(rgb_a.r);
-    unsigned char out_g = static_cast<unsigned char>(rgb_a.g);
-    unsigned char out_b = static_cast<unsigned char>(rgb_a.b);
-    filament_mixer_lerp(static_cast<unsigned char>(rgb_a.r),
-                        static_cast<unsigned char>(rgb_a.g),
-                        static_cast<unsigned char>(rgb_a.b),
-                        static_cast<unsigned char>(rgb_b.r),
-                        static_cast<unsigned char>(rgb_b.g),
-                        static_cast<unsigned char>(rgb_b.b),
-                        t, &out_r, &out_g, &out_b);
-
-    return rgb_to_hex({int(out_r), int(out_g), int(out_b)});
+    return blend_color_multi({{ color_a, safe_a }, { color_b, safe_b }});
 }
 
 void MixedFilamentManager::refresh_display_colors(const std::vector<std::string> &filament_colours)
