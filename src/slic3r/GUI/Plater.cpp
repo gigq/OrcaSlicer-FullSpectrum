@@ -5,6 +5,7 @@
 #include "common_func/common_func.hpp"
 
 #include <cstddef>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
@@ -2271,13 +2272,21 @@ void Sidebar::jump_to_option(size_t selected)
 void Sidebar::on_filaments_change(size_t num_filaments)
 {
     auto& choices = combos_filament();
+    auto refresh_filament_combos = [&choices]() {
+        for (PlaterPresetComboBox *choice : choices) {
+            if (choice != nullptr)
+                choice->update();
+        }
+    };
 
     if (num_filaments == choices.size()) {
         // Project load may keep the same physical filament count while mixed
-        // definitions changed. Refresh mixed panel even without count changes.
+        // definitions changed. Refresh filament combos as well so imported
+        // project colours propagate to the physical filament swatches.
         const bool sync_manager = !p->m_skip_mixed_filament_sync_once;
         p->m_skip_mixed_filament_sync_once = false;
         update_ui_from_settings();
+        refresh_filament_combos();
         update_dynamic_filament_list();
         update_mixed_filament_panel(sync_manager);
         return;
@@ -2321,6 +2330,7 @@ void Sidebar::on_filaments_change(size_t num_filaments)
     Layout();
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
+    refresh_filament_combos();
     update_dynamic_filament_list();
     update_mixed_filament_panel();
 }
@@ -2395,6 +2405,770 @@ wxColour blend_multi_filament_mixer(const std::vector<wxColour> &colors, const s
         return wxColour("#26A69A");
 
     return wxColour(out_r, out_g, out_b);
+}
+
+struct ImportedLabColor
+{
+    double l = 0.0;
+    double a = 0.0;
+    double b = 0.0;
+};
+
+double srgb_channel_to_linear(const double srgb)
+{
+    return (srgb <= 0.04045) ? (srgb / 12.92) : std::pow((srgb + 0.055) / 1.055, 2.4);
+}
+
+double linear_channel_to_srgb(const double linear)
+{
+    const double clamped = std::clamp(linear, 0.0, 1.0);
+    return (clamped <= 0.0031308) ? (12.92 * clamped) : (1.055 * std::pow(clamped, 1.0 / 2.4) - 0.055);
+}
+
+double lab_axis_from_xyz(const double value)
+{
+    return (value > 0.008856) ? std::cbrt(value) : (7.787 * value + 16.0 / 116.0);
+}
+
+ImportedLabColor color_to_lab(const wxColour &color)
+{
+    const double r = srgb_channel_to_linear(double(color.Red()) / 255.0);
+    const double g = srgb_channel_to_linear(double(color.Green()) / 255.0);
+    const double b = srgb_channel_to_linear(double(color.Blue()) / 255.0);
+
+    const double x = lab_axis_from_xyz((r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047);
+    const double y = lab_axis_from_xyz(r * 0.2126 + g * 0.7152 + b * 0.0722);
+    const double z = lab_axis_from_xyz((r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883);
+
+    ImportedLabColor out;
+    out.l = 116.0 * y - 16.0;
+    out.a = 500.0 * (x - y);
+    out.b = 200.0 * (y - z);
+    return out;
+}
+
+std::string normalize_imported_color_hex(std::string value)
+{
+    if (value.size() == 9 && value[0] == '#') {
+        const bool rgba_hex = std::all_of(value.begin() + 1, value.end(), [](unsigned char ch) {
+            return std::isxdigit(ch) != 0;
+        });
+        if (rgba_hex)
+            value.resize(7);
+    }
+    return value;
+}
+
+struct ImportedFilamentBlend
+{
+    std::vector<unsigned int> component_ids;
+    std::vector<int>          weights;
+    std::string               manual_pattern;
+    unsigned int              component_a = 0;
+    unsigned int              component_b = 0;
+    int                       mix_b_percent = 0;
+    double                    delta_e = std::numeric_limits<double>::max();
+    double                    score = std::numeric_limits<double>::max();
+};
+
+wxColour blend_imported_filament_preview(const std::vector<wxColour> &colors, const std::vector<double> &weights);
+
+double color_distance_delta_e(const ImportedLabColor &left, const ImportedLabColor &right)
+{
+    const double c1      = std::sqrt(left.a * left.a + left.b * left.b);
+    const double c2      = std::sqrt(right.a * right.a + right.b * right.b);
+    const double c_avg   = 0.5 * (c1 + c2);
+    const double c_avg_7 = std::pow(c_avg, 7.0);
+    const double g       = 0.5 * (1.0 - std::sqrt(c_avg_7 / (c_avg_7 + 6103515625.0)));
+
+    const double a1p = left.a * (1.0 + g);
+    const double a2p = right.a * (1.0 + g);
+    const double c1p = std::sqrt(a1p * a1p + left.b * left.b);
+    const double c2p = std::sqrt(a2p * a2p + right.b * right.b);
+
+    auto hue = [](double a, double b) {
+        if (a == 0.0 && b == 0.0)
+            return 0.0;
+        double out = std::atan2(b, a) * 180.0 / PI;
+        if (out < 0.0)
+            out += 360.0;
+        return out;
+    };
+
+    const double h1p = hue(a1p, left.b);
+    const double h2p = hue(a2p, right.b);
+    const double dlp = right.l - left.l;
+    const double dcp = c2p - c1p;
+
+    double dhp = 0.0;
+    if (c1p * c2p != 0.0) {
+        if (std::abs(h2p - h1p) <= 180.0)
+            dhp = h2p - h1p;
+        else if (h2p - h1p > 180.0)
+            dhp = h2p - h1p - 360.0;
+        else
+            dhp = h2p - h1p + 360.0;
+    }
+
+    const double dh_cap = 2.0 * std::sqrt(c1p * c2p) * std::sin((dhp * 0.5) * PI / 180.0);
+    const double l_avg  = 0.5 * (left.l + right.l);
+    const double c_avgp = 0.5 * (c1p + c2p);
+
+    double h_avgp = h1p + h2p;
+    if (c1p * c2p != 0.0) {
+        if (std::abs(h1p - h2p) <= 180.0)
+            h_avgp = 0.5 * (h1p + h2p);
+        else if (h1p + h2p < 360.0)
+            h_avgp = 0.5 * (h1p + h2p + 360.0);
+        else
+            h_avgp = 0.5 * (h1p + h2p - 360.0);
+    }
+
+    const double t = 1.0 - 0.17 * std::cos((h_avgp - 30.0) * PI / 180.0) +
+                     0.24 * std::cos((2.0 * h_avgp) * PI / 180.0) +
+                     0.32 * std::cos((3.0 * h_avgp + 6.0) * PI / 180.0) -
+                     0.20 * std::cos((4.0 * h_avgp - 63.0) * PI / 180.0);
+    const double sl = 1.0 + 0.015 * std::pow(l_avg - 50.0, 2.0) / std::sqrt(20.0 + std::pow(l_avg - 50.0, 2.0));
+    const double sc = 1.0 + 0.045 * c_avgp;
+    const double sh = 1.0 + 0.015 * c_avgp * t;
+
+    const double c_avgp_7 = std::pow(c_avgp, 7.0);
+    const double rc       = 2.0 * std::sqrt(c_avgp_7 / (c_avgp_7 + 6103515625.0));
+    const double d_theta  = 30.0 * std::exp(-std::pow((h_avgp - 275.0) / 25.0, 2.0));
+    const double rt       = -std::sin((2.0 * d_theta) * PI / 180.0) * rc;
+
+    const double l_term = dlp / sl;
+    const double c_term = dcp / sc;
+    const double h_term = dh_cap / sh;
+    return std::sqrt(l_term * l_term + c_term * c_term + h_term * h_term + rt * c_term * h_term);
+}
+
+wxColour blend_imported_filament_preview(const std::vector<wxColour> &colors, const std::vector<double> &weights)
+{
+    if (colors.empty() || weights.empty())
+        return wxColour("#26A69A");
+
+    double total_weight = 0.0;
+    double r_absorbance = 0.0;
+    double g_absorbance = 0.0;
+    double b_absorbance = 0.0;
+    constexpr double k_min_channel = 1e-6;
+
+    for (size_t i = 0; i < colors.size() && i < weights.size(); ++i) {
+        const double weight = std::max(0.0, weights[i]);
+        if (weight <= 0.0)
+            continue;
+
+        const wxColour safe = colors[i].IsOk() ? colors[i] : wxColour("#26A69A");
+        r_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(safe.Red()) / 255.0))) * weight;
+        g_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(safe.Green()) / 255.0))) * weight;
+        b_absorbance += -std::log(std::max(k_min_channel, srgb_channel_to_linear(double(safe.Blue()) / 255.0))) * weight;
+        total_weight += weight;
+    }
+
+    if (total_weight <= 0.0)
+        return wxColour("#26A69A");
+
+    const auto to_byte = [](double value) {
+        return static_cast<unsigned char>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+    };
+
+    const double r_linear = std::exp(-r_absorbance / total_weight);
+    const double g_linear = std::exp(-g_absorbance / total_weight);
+    const double b_linear = std::exp(-b_absorbance / total_weight);
+
+    return wxColour(to_byte(linear_channel_to_srgb(r_linear)),
+                    to_byte(linear_channel_to_srgb(g_linear)),
+                    to_byte(linear_channel_to_srgb(b_linear)));
+}
+
+wxColour simulate_imported_filament_sequence(const std::vector<unsigned int> &sequence,
+                                             const std::vector<std::string>  &physical_colors)
+{
+    if (sequence.empty() || physical_colors.empty())
+        return wxColour("#26A69A");
+
+    std::vector<int> counts(physical_colors.size() + 1, 0);
+    for (const unsigned int id : sequence) {
+        if (id >= 1 && id <= physical_colors.size())
+            ++counts[id];
+    }
+
+    std::vector<wxColour> blend_colors;
+    std::vector<double>   blend_weights;
+    blend_colors.reserve(physical_colors.size());
+    blend_weights.reserve(physical_colors.size());
+    for (size_t id = 1; id < counts.size(); ++id) {
+        if (counts[id] <= 0)
+            continue;
+        blend_colors.emplace_back(parse_mixed_color(physical_colors[id - 1]));
+        blend_weights.emplace_back(double(counts[id]));
+    }
+
+    return blend_imported_filament_preview(blend_colors, blend_weights);
+}
+
+std::vector<int> normalize_imported_weights_to_percent(const std::vector<int> &weights)
+{
+    std::vector<int> out(weights.size(), 0);
+    if (weights.empty())
+        return out;
+
+    int total = 0;
+    for (const int weight : weights)
+        total += std::max(0, weight);
+    if (total <= 0)
+        return out;
+
+    std::vector<double> remainders(weights.size(), 0.0);
+    int                 assigned = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const double exact = 100.0 * double(std::max(0, weights[i])) / double(total);
+        out[i]             = int(std::floor(exact));
+        remainders[i]      = exact - double(out[i]);
+        assigned += out[i];
+    }
+
+    int missing = std::max(0, 100 - assigned);
+    while (missing > 0) {
+        size_t best_idx = 0;
+        double best_rem = -1.0;
+        for (size_t i = 0; i < remainders.size(); ++i) {
+            if (weights[i] <= 0)
+                continue;
+            if (remainders[i] > best_rem) {
+                best_idx = i;
+                best_rem = remainders[i];
+            }
+        }
+        ++out[best_idx];
+        remainders[best_idx] = 0.0;
+        --missing;
+    }
+
+    return out;
+}
+
+std::vector<unsigned int> build_imported_filament_sequence(const std::vector<unsigned int> &ids,
+                                                           const std::vector<int>          &counts)
+{
+    if (ids.empty() || counts.empty() || ids.size() != counts.size())
+        return {};
+
+    std::vector<unsigned int> filtered_ids;
+    std::vector<int>          filtered_counts;
+    filtered_ids.reserve(ids.size());
+    filtered_counts.reserve(counts.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (counts[i] <= 0)
+            continue;
+        filtered_ids.emplace_back(ids[i]);
+        filtered_counts.emplace_back(counts[i]);
+    }
+
+    const int cycle = std::accumulate(filtered_counts.begin(), filtered_counts.end(), 0);
+    if (filtered_ids.empty() || cycle <= 0)
+        return {};
+
+    std::vector<unsigned int> sequence;
+    std::vector<int>          emitted(filtered_counts.size(), 0);
+    sequence.reserve(size_t(cycle));
+    for (int pos = 0; pos < cycle; ++pos) {
+        size_t best_idx   = 0;
+        double best_score = -1e9;
+        for (size_t i = 0; i < filtered_counts.size(); ++i) {
+            const double target = double((pos + 1) * filtered_counts[i]) / double(cycle);
+            const double score  = target - double(emitted[i]);
+            if (score > best_score) {
+                best_idx   = i;
+                best_score = score;
+            }
+        }
+        ++emitted[best_idx];
+        sequence.emplace_back(filtered_ids[best_idx]);
+    }
+
+    return sequence;
+}
+
+std::vector<unsigned int> imported_sequence_component_ids(const std::vector<unsigned int> &sequence)
+{
+    std::vector<unsigned int> ids;
+    ids.reserve(sequence.size());
+    for (const unsigned int id : sequence) {
+        if (id == 0 || std::find(ids.begin(), ids.end(), id) != ids.end())
+            continue;
+        ids.emplace_back(id);
+    }
+    return ids;
+}
+
+double imported_lab_chroma(const ImportedLabColor &color)
+{
+    return std::sqrt(color.a * color.a + color.b * color.b);
+}
+
+double imported_lab_hue(const ImportedLabColor &color)
+{
+    if (color.a == 0.0 && color.b == 0.0)
+        return 0.0;
+
+    double out = std::atan2(color.b, color.a) * 180.0 / PI;
+    if (out < 0.0)
+        out += 360.0;
+    return out;
+}
+
+double imported_hue_delta(const double left, const double right)
+{
+    const double delta = std::abs(left - right);
+    return std::min(delta, 360.0 - delta);
+}
+
+unsigned int darkest_imported_physical_color_id(const std::vector<std::string> &physical_colors)
+{
+    unsigned int best_id = 0;
+    double       best_l  = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < physical_colors.size(); ++i) {
+        const double lightness = color_to_lab(parse_mixed_color(physical_colors[i])).l;
+        if (lightness < best_l) {
+            best_l  = lightness;
+            best_id = unsigned(i + 1);
+        }
+    }
+    return best_id;
+}
+
+double imported_blend_score(const ImportedLabColor        &target_lab,
+                            const ImportedLabColor        &blended_lab,
+                            const std::vector<unsigned int> &component_ids,
+                            const std::vector<int>          &component_weights,
+                            const std::vector<std::string>  &physical_colors,
+                            const double                    raw_delta_e)
+{
+    double       score          = raw_delta_e;
+    const double target_chroma  = imported_lab_chroma(target_lab);
+    const double blended_chroma = imported_lab_chroma(blended_lab);
+    const bool neutral_target   = target_chroma < 12.0;
+
+    if (neutral_target) {
+        score += 1.25 * std::max(0.0, blended_chroma - target_chroma);
+        score += 0.10 * std::abs(blended_lab.l - target_lab.l);
+
+        if (target_lab.l < 35.0) {
+            const unsigned int darkest_id = darkest_imported_physical_color_id(physical_colors);
+            if (darkest_id != 0 && std::find(component_ids.begin(), component_ids.end(), darkest_id) == component_ids.end())
+                score += 10.0;
+            score += 0.8 * blended_chroma;
+        }
+
+        if (target_lab.l > 85.0) {
+            score += 0.6 * blended_chroma;
+            score += 0.12 * std::max(0.0, target_lab.l - blended_lab.l);
+        }
+    }
+
+    if (target_chroma >= 25.0) {
+        score += 0.02 * std::max(0.0, target_chroma - blended_chroma);
+        score += 0.12 * imported_hue_delta(imported_lab_hue(target_lab), imported_lab_hue(blended_lab));
+
+        if (component_ids.size() > 1 && component_ids.size() == component_weights.size()) {
+            const double target_hue = imported_lab_hue(target_lab);
+            double best_component_hue_delta   = std::numeric_limits<double>::max();
+            double second_component_hue_delta = std::numeric_limits<double>::max();
+            size_t preferred_component_idx     = size_t(-1);
+
+            for (size_t i = 0; i < component_ids.size(); ++i) {
+                const unsigned int component_id = component_ids[i];
+                if (component_id == 0 || component_id > physical_colors.size())
+                    continue;
+
+                const ImportedLabColor component_lab = color_to_lab(parse_mixed_color(physical_colors[component_id - 1]));
+                if (imported_lab_chroma(component_lab) < 15.0)
+                    continue;
+
+                const double hue_delta = imported_hue_delta(target_hue, imported_lab_hue(component_lab));
+                if (hue_delta < best_component_hue_delta) {
+                    second_component_hue_delta = best_component_hue_delta;
+                    best_component_hue_delta   = hue_delta;
+                    preferred_component_idx    = i;
+                } else if (hue_delta < second_component_hue_delta) {
+                    second_component_hue_delta = hue_delta;
+                }
+            }
+
+            if (preferred_component_idx != size_t(-1)) {
+                int total_weight = 0;
+                for (const int weight : component_weights)
+                    total_weight += std::max(0, weight);
+
+                if (total_weight > 0) {
+                    const double preferred_share =
+                        100.0 * double(std::max(0, component_weights[preferred_component_idx])) / double(total_weight);
+                    const double hue_margin = (second_component_hue_delta < std::numeric_limits<double>::max()) ?
+                                              std::max(0.0, second_component_hue_delta - best_component_hue_delta) :
+                                              30.0;
+                    const double confidence = std::clamp(hue_margin / 20.0, 0.0, 1.0);
+                    score += confidence * 0.40 * std::max(0.0, 65.0 - preferred_share);
+                }
+            }
+        }
+    }
+
+    return score;
+}
+
+std::pair<unsigned int, unsigned int> select_imported_pattern_components(const std::vector<unsigned int> &component_ids)
+{
+    if (component_ids.empty())
+        return { 0, 0 };
+
+    std::vector<unsigned int> aliases;
+    aliases.reserve(2);
+    for (const unsigned int id : component_ids) {
+        if (id <= 2 && std::find(aliases.begin(), aliases.end(), id) == aliases.end())
+            aliases.emplace_back(id);
+    }
+    for (const unsigned int id : component_ids) {
+        if (aliases.size() >= 2)
+            break;
+        if (std::find(aliases.begin(), aliases.end(), id) == aliases.end())
+            aliases.emplace_back(id);
+    }
+
+    if (aliases.empty())
+        return { 0, 0 };
+    if (aliases.size() == 1)
+        aliases.emplace_back(aliases.front());
+    return { aliases[0], aliases[1] };
+}
+
+std::string encode_imported_manual_pattern(const std::vector<unsigned int> &sequence,
+                                           unsigned int                     component_a,
+                                           unsigned int                     component_b)
+{
+    std::string encoded;
+    encoded.reserve(sequence.size());
+    for (const unsigned int id : sequence) {
+        if (id == component_a)
+            encoded.push_back('1');
+        else if (id == component_b)
+            encoded.push_back('2');
+        else if (id >= 3 && id <= 9)
+            encoded.push_back(char('0' + id));
+        else
+            return std::string();
+    }
+    return encoded;
+}
+
+ImportedFilamentBlend approximate_imported_filament_blend(const std::string &target_hex,
+                                                          const std::vector<std::string> &physical_colors)
+{
+    ImportedFilamentBlend best;
+    if (physical_colors.empty())
+        return best;
+
+    constexpr double k_target_delta_e = 2.0;
+    constexpr int    k_max_sequence_length = 24;
+
+    const wxColour         target_color = parse_mixed_color(normalize_imported_color_hex(target_hex));
+    const ImportedLabColor target_lab = color_to_lab(target_color);
+    std::vector<std::pair<double, unsigned int>> ranked_ids;
+    ranked_ids.reserve(physical_colors.size());
+    for (size_t i = 0; i < physical_colors.size(); ++i) {
+        if (i + 1 > 9)
+            continue;
+        ranked_ids.emplace_back(color_distance_delta_e(target_lab, color_to_lab(parse_mixed_color(physical_colors[i]))), unsigned(i + 1));
+    }
+
+    std::sort(ranked_ids.begin(), ranked_ids.end(), [](const auto &left, const auto &right) {
+        if (left.first != right.first)
+            return left.first < right.first;
+        return left.second < right.second;
+    });
+
+    std::vector<unsigned int> candidate_ids;
+    std::vector<double>       candidate_delta_e;
+    candidate_ids.reserve(std::min<size_t>(4, ranked_ids.size()));
+    candidate_delta_e.reserve(std::min<size_t>(4, ranked_ids.size()));
+    for (size_t i = 0; i < ranked_ids.size() && candidate_ids.size() < 4; ++i) {
+        candidate_ids.emplace_back(ranked_ids[i].second);
+        candidate_delta_e.emplace_back(ranked_ids[i].first);
+    }
+
+    if (candidate_ids.empty())
+        return best;
+
+    auto is_better = [](const ImportedFilamentBlend &candidate, const ImportedFilamentBlend &current_best) {
+        if (candidate.component_ids.empty())
+            return false;
+        if (current_best.component_ids.empty())
+            return true;
+        if (candidate.score + 1e-9 < current_best.score)
+            return true;
+        if (std::abs(candidate.score - current_best.score) > 1e-9)
+            return false;
+        if (candidate.delta_e + 1e-9 < current_best.delta_e)
+            return true;
+        if (std::abs(candidate.delta_e - current_best.delta_e) > 1e-9)
+            return false;
+        if (candidate.component_ids.size() != current_best.component_ids.size())
+            return candidate.component_ids.size() < current_best.component_ids.size();
+        return candidate.manual_pattern.size() < current_best.manual_pattern.size();
+    };
+
+    std::vector<int> raw_counts(candidate_ids.size(), 0);
+    for (int sequence_length = 1; sequence_length <= k_max_sequence_length; ++sequence_length) {
+        ImportedFilamentBlend best_for_length;
+        auto evaluate = [&](const std::vector<int> &counts) {
+            const std::vector<unsigned int> sequence = build_imported_filament_sequence(candidate_ids, counts);
+            if (sequence.empty())
+                return;
+
+            const wxColour blended = simulate_imported_filament_sequence(sequence, physical_colors);
+            ImportedFilamentBlend candidate;
+            const ImportedLabColor blended_lab = color_to_lab(blended);
+            candidate.delta_e = color_distance_delta_e(target_lab, blended_lab);
+            candidate.component_ids = imported_sequence_component_ids(sequence);
+
+            std::vector<int> component_counts(candidate.component_ids.size(), 0);
+            for (const unsigned int id : sequence) {
+                auto it = std::find(candidate.component_ids.begin(), candidate.component_ids.end(), id);
+                if (it != candidate.component_ids.end())
+                    ++component_counts[size_t(it - candidate.component_ids.begin())];
+            }
+            candidate.weights = normalize_imported_weights_to_percent(component_counts);
+
+            if (candidate.component_ids.size() > 1) {
+                std::tie(candidate.component_a, candidate.component_b) = select_imported_pattern_components(candidate.component_ids);
+                if (candidate.component_a == 0 || candidate.component_b == 0)
+                    return;
+
+                candidate.manual_pattern = encode_imported_manual_pattern(sequence, candidate.component_a, candidate.component_b);
+                if (candidate.manual_pattern.empty())
+                    return;
+
+                auto mix_it = std::find(candidate.component_ids.begin(), candidate.component_ids.end(), candidate.component_b);
+                if (mix_it != candidate.component_ids.end())
+                    candidate.mix_b_percent = candidate.weights[size_t(mix_it - candidate.component_ids.begin())];
+            }
+
+            candidate.score = imported_blend_score(target_lab,
+                                                   blended_lab,
+                                                   candidate.component_ids,
+                                                   component_counts,
+                                                   physical_colors,
+                                                   candidate.delta_e);
+
+            if (is_better(candidate, best_for_length))
+                best_for_length = std::move(candidate);
+        };
+
+        std::function<void(size_t, int)> search = [&](size_t idx, int remaining) {
+            if (idx + 1 >= candidate_ids.size()) {
+                raw_counts[idx] = remaining;
+                evaluate(raw_counts);
+                return;
+            }
+
+            for (int count = 0; count <= remaining; ++count) {
+                raw_counts[idx] = count;
+                search(idx + 1, remaining - count);
+            }
+        };
+        search(0, sequence_length);
+
+        if (is_better(best_for_length, best))
+            best = std::move(best_for_length);
+        if (!best.component_ids.empty() && best.delta_e <= k_target_delta_e)
+            break;
+    }
+
+    return best;
+}
+
+std::string encode_imported_gradient_component_ids(const std::vector<unsigned int> &component_ids)
+{
+    std::string encoded;
+    encoded.reserve(component_ids.size());
+    for (const unsigned int id : component_ids) {
+        if (id == 0 || id > 9)
+            return std::string();
+        encoded.push_back(char('0' + id));
+    }
+    return encoded;
+}
+
+std::string encode_imported_gradient_component_weights(const std::vector<int> &weights)
+{
+    std::ostringstream encoded;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        if (i > 0)
+            encoded << '/';
+        encoded << std::max(0, weights[i]);
+    }
+    return encoded.str();
+}
+
+unsigned int mixed_virtual_id_by_stable_id(const Slic3r::MixedFilamentManager &manager,
+                                           size_t                              num_physical,
+                                           uint64_t                            stable_id)
+{
+    unsigned int next_virtual_id = unsigned(num_physical + 1);
+    for (const Slic3r::MixedFilament &mixed : manager.mixed_filaments()) {
+        if (!mixed.enabled || mixed.deleted)
+            continue;
+        if (mixed.stable_id == stable_id)
+            return next_virtual_id;
+        ++next_virtual_id;
+    }
+    return 0;
+}
+
+void remap_imported_model_filaments(Slic3r::Model &model,
+                                    const std::vector<unsigned int> &filament_id_map,
+                                    size_t                           total_filaments)
+{
+    EnforcerBlockerStateMap state_map;
+    for (size_t i = 0; i < state_map.size(); ++i)
+        state_map[i] = EnforcerBlockerType(i);
+
+    for (size_t imported_id = 1; imported_id < filament_id_map.size() && imported_id < state_map.size(); ++imported_id) {
+        const unsigned int mapped = filament_id_map[imported_id];
+        if (mapped == 0 || mapped >= state_map.size() || mapped > total_filaments)
+            continue;
+        state_map[imported_id] = EnforcerBlockerType(mapped);
+    }
+
+    for (Slic3r::ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        if (object->config.has("extruder")) {
+            const int extruder_id = object->config.extruder();
+            if (extruder_id > 0 && size_t(extruder_id) < filament_id_map.size() && filament_id_map[size_t(extruder_id)] > 0)
+                object->config.set("extruder", int(filament_id_map[size_t(extruder_id)]));
+        }
+
+        for (Slic3r::ModelVolume *volume : object->volumes) {
+            if (volume == nullptr)
+                continue;
+            if (volume->config.has("extruder")) {
+                const int extruder_id = volume->config.extruder();
+                if (extruder_id > 0 && size_t(extruder_id) < filament_id_map.size() && filament_id_map[size_t(extruder_id)] > 0)
+                    volume->config.set("extruder", int(filament_id_map[size_t(extruder_id)]));
+            }
+            volume->remap_extruder_ids(total_filaments, state_map);
+        }
+    }
+}
+
+bool synthesize_imported_3mf_filaments(Slic3r::PresetBundle           *preset_bundle,
+                                       Slic3r::Model                  &model,
+                                       const std::vector<std::string> &imported_filament_colors,
+                                       size_t                          imported_filament_count)
+{
+    if (preset_bundle == nullptr || imported_filament_count == 0 || imported_filament_colors.size() < imported_filament_count)
+        return false;
+
+    const size_t num_physical = preset_bundle->filament_presets.size();
+    if (num_physical < 2 || num_physical >= size_t(EnforcerBlockerType::ExtruderMax))
+        return false;
+
+    ConfigOptionStrings *color_opt = preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    if (color_opt == nullptr)
+        return false;
+
+    std::vector<std::string> physical_colors = color_opt->values;
+    physical_colors.resize(num_physical, "#26A69A");
+
+    preset_bundle->update_multi_material_filament_presets();
+    auto &mixed_mgr = preset_bundle->mixed_filaments;
+
+    auto manual_row_stable_id = [&mixed_mgr](unsigned int        component_a,
+                                             unsigned int        component_b,
+                                             const std::string  &gradient_ids,
+                                             const std::string  &gradient_weights,
+                                             const std::string  &manual_pattern) -> uint64_t {
+        for (const Slic3r::MixedFilament &mixed : mixed_mgr.mixed_filaments()) {
+            if (mixed.deleted || !mixed.enabled)
+                continue;
+            if (mixed.distribution_mode != int(Slic3r::MixedFilament::Simple))
+                continue;
+            if (mixed.component_a == component_a &&
+                mixed.component_b == component_b &&
+                mixed.gradient_component_ids == gradient_ids &&
+                mixed.gradient_component_weights == gradient_weights &&
+                Slic3r::MixedFilamentManager::normalize_manual_pattern(mixed.manual_pattern) == manual_pattern)
+                return mixed.stable_id;
+        }
+        return 0;
+    };
+
+    std::vector<unsigned int> imported_filament_map(imported_filament_count + 1, 0);
+    std::vector<uint64_t>     imported_virtual_stable_ids(imported_filament_count + 1, 0);
+
+    for (size_t imported_id = 1; imported_id <= imported_filament_count; ++imported_id) {
+        const std::string normalized_imported_color = normalize_imported_color_hex(imported_filament_colors[imported_id - 1]);
+        ImportedFilamentBlend blend = approximate_imported_filament_blend(normalized_imported_color, physical_colors);
+        if (blend.component_ids.empty() || blend.weights.empty())
+            return false;
+
+        if (blend.component_ids.size() == 1) {
+            imported_filament_map[imported_id] = blend.component_ids.front();
+            continue;
+        }
+
+        const std::string gradient_ids     = encode_imported_gradient_component_ids(blend.component_ids);
+        const std::string gradient_weights = encode_imported_gradient_component_weights(blend.weights);
+        const std::string manual_pattern   = Slic3r::MixedFilamentManager::normalize_manual_pattern(blend.manual_pattern);
+        if (gradient_ids.empty() || gradient_weights.empty() || manual_pattern.empty() || blend.component_a == 0 || blend.component_b == 0)
+            return false;
+
+        uint64_t stable_id = manual_row_stable_id(blend.component_a, blend.component_b, gradient_ids, gradient_weights, manual_pattern);
+        if (stable_id == 0) {
+            const size_t previous_size = mixed_mgr.mixed_filaments().size();
+            mixed_mgr.add_custom_filament(blend.component_a, blend.component_b, blend.mix_b_percent, physical_colors);
+            if (mixed_mgr.mixed_filaments().size() <= previous_size)
+                return false;
+            Slic3r::MixedFilament &mixed = mixed_mgr.mixed_filaments().back();
+            mixed.component_a                = blend.component_a;
+            mixed.component_b                = blend.component_b;
+            mixed.gradient_component_ids     = gradient_ids;
+            mixed.gradient_component_weights = gradient_weights;
+            mixed.manual_pattern             = manual_pattern;
+            mixed.distribution_mode          = int(Slic3r::MixedFilament::Simple);
+            mixed.mix_b_percent              = blend.mix_b_percent;
+            stable_id                        = mixed.stable_id;
+        }
+        imported_virtual_stable_ids[imported_id] = stable_id;
+    }
+
+    const std::string serialized = mixed_mgr.serialize_custom_entries();
+    if (ConfigOptionString *opt = preset_bundle->project_config.option<ConfigOptionString>("mixed_filament_definitions"))
+        opt->value = serialized;
+    else
+        preset_bundle->project_config.set_key_value("mixed_filament_definitions", new ConfigOptionString(serialized));
+
+    preset_bundle->update_multi_material_filament_presets();
+
+    for (size_t imported_id = 1; imported_id <= imported_filament_count; ++imported_id) {
+        if (imported_filament_map[imported_id] != 0)
+            continue;
+
+        const unsigned int mapped_id =
+            mixed_virtual_id_by_stable_id(preset_bundle->mixed_filaments, num_physical, imported_virtual_stable_ids[imported_id]);
+        if (mapped_id == 0)
+            return false;
+        imported_filament_map[imported_id] = mapped_id;
+    }
+
+    const size_t total_filaments = preset_bundle->mixed_filaments.total_filaments(num_physical);
+    if (total_filaments > size_t(EnforcerBlockerType::ExtruderMax))
+        return false;
+
+    remap_imported_model_filaments(model, imported_filament_map, total_filaments);
+    return true;
 }
 
 class MixedGradientSelector : public wxPanel
@@ -7484,7 +8258,19 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         if (geometry_only_project_import && preset_bundle != nullptr) {
                             const size_t current_num_filaments = preset_bundle->filament_presets.size();
                             const bool current_project_empty = this->model.objects.empty();
-                            if (current_project_empty) {
+                            const bool synthesized_imported_filaments =
+                                current_num_filaments >= 2 &&
+                                imported_filament_colors.size() >= desired_physical_filaments &&
+                                synthesize_imported_3mf_filaments(preset_bundle, model, imported_filament_colors, desired_physical_filaments);
+
+                            if (synthesized_imported_filaments) {
+                                size = int(current_num_filaments);
+                                BOOST_LOG_TRIVIAL(info) << "3MF geometry import synthesized imported colours from current physical filaments"
+                                                        << " current_num_filaments=" << current_num_filaments
+                                                        << " imported_physical_filaments=" << desired_physical_filaments
+                                                        << " mixed_enabled=" << preset_bundle->mixed_filaments.enabled_count();
+                                wxGetApp().plater()->on_filaments_change(current_num_filaments);
+                            } else if (current_project_empty) {
                                 static const t_config_option_keys imported_project_option_keys = {
                                     "filament_colour",
                                     "mixed_filament_definitions",

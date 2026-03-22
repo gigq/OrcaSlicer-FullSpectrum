@@ -1428,6 +1428,27 @@ std::string MixedFilamentManager::blend_color(const std::string &color_a,
 void MixedFilamentManager::refresh_display_colors(const std::vector<std::string> &filament_colours)
 {
     for (MixedFilament &mf : m_mixed) {
+        const std::string normalized_pattern = normalize_manual_pattern(mf.manual_pattern);
+        if (!normalized_pattern.empty()) {
+            std::vector<int> counts(filament_colours.size() + 1, 0);
+            for (const char token : normalized_pattern) {
+                const unsigned int resolved = physical_filament_from_pattern_step(token, mf, filament_colours.size());
+                if (resolved >= 1 && resolved <= filament_colours.size())
+                    ++counts[resolved];
+            }
+
+            std::vector<std::pair<std::string, int>> color_percents;
+            color_percents.reserve(filament_colours.size());
+            for (size_t id = 1; id < counts.size(); ++id) {
+                if (counts[id] <= 0)
+                    continue;
+                color_percents.emplace_back(filament_colours[id - 1], counts[id]);
+            }
+
+            mf.display_color = color_percents.empty() ? "#26A69A" : blend_color_multi(color_percents);
+            continue;
+        }
+
         const std::vector<unsigned int> gradient_ids = decode_gradient_component_ids(mf.gradient_component_ids, filament_colours.size());
         if (mf.distribution_mode != int(MixedFilament::Simple) && gradient_ids.size() >= 3) {
             const std::vector<int> gradient_weights =
