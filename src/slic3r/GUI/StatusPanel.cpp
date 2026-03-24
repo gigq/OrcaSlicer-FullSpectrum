@@ -1050,14 +1050,30 @@ wxBoxSizer *StatusBasePanel::create_monitoring_page()
 //    media_ctrl_panel              = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize);
 //    media_ctrl_panel->SetBackgroundColour(*wxBLACK);
 //    wxBoxSizer *bSizer_monitoring = new wxBoxSizer(wxVERTICAL);
+#ifdef __WXGTK__
+    media_ctrl_panel = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize);
+    media_ctrl_panel->SetBackgroundColour(*wxWHITE);
+    media_ctrl_panel->SetMinSize(wxSize(PAGE_MIN_WIDTH, FromDIP(288)));
+
+    auto *placeholder_sizer = new wxBoxSizer(wxVERTICAL);
+    auto *placeholder_label = new Label(media_ctrl_panel, _L("Camera preview is unavailable in this Linux build."));
+    placeholder_label->SetForegroundColour(PAGE_TITLE_FONT_COL);
+    placeholder_sizer->AddStretchSpacer();
+    placeholder_sizer->Add(placeholder_label, 0, wxALIGN_CENTER | wxLEFT | wxRIGHT, FromDIP(24));
+    placeholder_sizer->AddStretchSpacer();
+    media_ctrl_panel->SetSizer(placeholder_sizer);
+#else
     m_media_ctrl = new wxMediaCtrl2(this);
     m_media_ctrl->SetMinSize(wxSize(PAGE_MIN_WIDTH, FromDIP(288)));
+#endif
 
     m_custom_camera_view = WebView::CreateWebView(this, wxEmptyString);
     m_custom_camera_view->EnableContextMenu(false);
     Bind(wxEVT_WEBVIEW_NAVIGATING, &StatusBasePanel::on_webview_navigating, this, m_custom_camera_view->GetId());
 
+#ifndef __WXGTK__
     m_media_play_ctrl = new MediaPlayCtrl(this, m_media_ctrl, wxDefaultPosition, wxSize(-1, FromDIP(40)));
+#endif
     m_custom_camera_view->Hide();
     m_custom_camera_view->Bind(wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, [this](wxWebViewEvent& evt) {
         if (evt.GetString() == "leavepictureinpicture") {
@@ -1070,9 +1086,14 @@ wxBoxSizer *StatusBasePanel::create_monitoring_page()
         }
     });
 
-    sizer->Add(m_media_ctrl, 1, wxEXPAND | wxALL, 0);
+    if (media_ctrl_panel) {
+        sizer->Add(media_ctrl_panel, 1, wxEXPAND | wxALL, 0);
+    } else {
+        sizer->Add(m_media_ctrl, 1, wxEXPAND | wxALL, 0);
+    }
     sizer->Add(m_custom_camera_view, 1, wxEXPAND | wxALL, 0);
-    sizer->Add(m_media_play_ctrl, 0, wxEXPAND | wxALL, 0);
+    if (m_media_play_ctrl)
+        sizer->Add(m_media_play_ctrl, 0, wxEXPAND | wxALL, 0);
 //    media_ctrl_panel->SetSizer(bSizer_monitoring);
 //    media_ctrl_panel->Layout();
 //
@@ -1684,13 +1705,14 @@ void StatusPanel::update_camera_state(MachineObject* obj)
 
     //vcamera
     if (obj->virtual_camera) {
-        if (m_last_vcamera != (m_media_play_ctrl->IsStreaming() ? 1: 0)) {
-            if (m_media_play_ctrl->IsStreaming()) {
+        const bool is_streaming = m_media_play_ctrl && m_media_play_ctrl->IsStreaming();
+        if (m_last_vcamera != (is_streaming ? 1 : 0)) {
+            if (is_streaming) {
                 m_bitmap_vcamera_img->SetBitmap(m_bitmap_vcamera_on.bmp());
             } else {
                 m_bitmap_vcamera_img->SetBitmap(m_bitmap_vcamera_off.bmp());
             }
-            m_last_vcamera = m_media_play_ctrl->IsStreaming() ? 1 : 0;
+            m_last_vcamera = is_streaming ? 1 : 0;
         }
         if (!m_bitmap_vcamera_img->IsShown())
             m_bitmap_vcamera_img->Show();
@@ -1701,7 +1723,7 @@ void StatusPanel::update_camera_state(MachineObject* obj)
 
     //camera setting
     if (m_camera_popup && m_camera_popup->IsShown()) {
-        bool show_vcamera = m_media_play_ctrl->IsStreaming();
+        bool show_vcamera = m_media_play_ctrl && m_media_play_ctrl->IsStreaming();
         m_camera_popup->update(show_vcamera);
     }
 
@@ -1794,7 +1816,8 @@ StatusPanel::StatusPanel(wxWindow *parent, wxWindowID id, const wxPoint &pos, co
     Bind(EVT_PRINT_ERROR_STOP, &StatusPanel::on_subtask_abort, this);
     Bind(EVT_LOAD_VAMS_TRAY, &StatusPanel::on_ams_load_vams, this);
     Bind(EVT_JUMP_TO_LIVEVIEW, [this](wxCommandEvent& e) {
-        m_media_play_ctrl->jump_to_play();
+        if (m_media_play_ctrl)
+            m_media_play_ctrl->jump_to_play();
         if (m_print_error_dlg)
             m_print_error_dlg->on_hide();
     });
@@ -4151,6 +4174,8 @@ void StatusPanel::on_switch_vcamera(wxMouseEvent &event)
     //if (!obj) return;
     //bool value = m_recording_button->get_switch_status();
     //obj->command_ipcam_record(!value);
+    if (!m_media_play_ctrl)
+        return;
     m_media_play_ctrl->ToggleStream();
     show_vcamera = m_media_play_ctrl->IsStreaming();
     if (m_camera_popup)
@@ -4160,6 +4185,7 @@ void StatusPanel::on_switch_vcamera(wxMouseEvent &event)
 void StatusPanel::on_camera_enter(wxMouseEvent& event)
 {
     if (obj) {
+        const bool is_streaming = m_media_play_ctrl && m_media_play_ctrl->IsStreaming();
         if (m_camera_popup == nullptr)
             m_camera_popup = std::make_shared<CameraPopup>(this);
         m_camera_popup->check_func_supported(obj);
@@ -4179,7 +4205,7 @@ void StatusPanel::on_camera_enter(wxMouseEvent& event)
         pos.x += sz.x;
         pos.y += sz.y;
         m_camera_popup->SetPosition(pos);
-        m_camera_popup->update(m_media_play_ctrl->IsStreaming());
+        m_camera_popup->update(is_streaming);
         m_camera_popup->Popup();
     }
 }
@@ -4193,11 +4219,15 @@ void StatusBasePanel::handle_camera_source_change()
 {
     const auto new_cam_url = wxGetApp().app_config->get("camera", "custom_source");
     const auto enabled = wxGetApp().app_config->get("camera", "enable_custom_source") == "true";
+    const bool builtin_camera_available = m_media_ctrl != nullptr;
 
     if (enabled && !new_cam_url.empty()) {
         m_custom_camera_view->LoadURL(new_cam_url);
         toggle_custom_camera();
-        m_camera_switch_button->Show();
+        if (builtin_camera_available)
+            m_camera_switch_button->Show();
+        else
+            m_camera_switch_button->Hide();
     } else {
         toggle_builtin_camera();
         m_camera_switch_button->Hide();
@@ -4207,8 +4237,12 @@ void StatusBasePanel::handle_camera_source_change()
 void StatusBasePanel::toggle_builtin_camera()
 {
     m_custom_camera_view->Hide();
-    m_media_ctrl->Show();
-    m_media_play_ctrl->Show();
+    if (media_ctrl_panel)
+        media_ctrl_panel->Show();
+    if (m_media_ctrl)
+        m_media_ctrl->Show();
+    if (m_media_play_ctrl)
+        m_media_play_ctrl->Show();
 }
 
 void StatusBasePanel::toggle_custom_camera()
@@ -4217,15 +4251,20 @@ void StatusBasePanel::toggle_custom_camera()
 
     if (enabled) {
         m_custom_camera_view->Show();
-        m_media_ctrl->Hide();
-        m_media_play_ctrl->Hide();
+        if (media_ctrl_panel)
+            media_ctrl_panel->Hide();
+        if (m_media_ctrl)
+            m_media_ctrl->Hide();
+        if (m_media_play_ctrl)
+            m_media_play_ctrl->Hide();
     }
 }
 
 void StatusBasePanel::on_camera_switch_toggled(wxMouseEvent& event)
 {
     const auto enabled = wxGetApp().app_config->get("camera", "enable_custom_source") == "true";
-    if (enabled && m_media_ctrl->IsShown()) {
+    const bool builtin_shown = (media_ctrl_panel && media_ctrl_panel->IsShown()) || (m_media_ctrl && m_media_ctrl->IsShown());
+    if (enabled && builtin_shown) {
         toggle_custom_camera();
     } else {
         toggle_builtin_camera();
@@ -4405,7 +4444,7 @@ void StatusPanel::rescale_camera_icons()
     m_bitmap_vcamera_on = ScalableBitmap(this, wxGetApp().dark_mode()?"monitor_vcamera_on_dark":"monitor_vcamera_on", 20);
     m_bitmap_vcamera_off = ScalableBitmap(this, wxGetApp().dark_mode()?"monitor_vcamera_off_dark":"monitor_vcamera_off", 20);
 
-    if (m_media_play_ctrl->IsStreaming()) {
+    if (m_media_play_ctrl && m_media_play_ctrl->IsStreaming()) {
         m_bitmap_vcamera_img->SetBitmap(m_bitmap_vcamera_on.bmp());
     }
     else {
@@ -4459,7 +4498,8 @@ void StatusPanel::msw_rescale()
     m_bmToggleBtn_timelapse->Rescale();
     m_panel_control_title->SetSize(wxSize(-1, FromDIP(PAGE_TITLE_HEIGHT)));
     //m_staticText_control->SetMinSize(wxSize(-1, PAGE_TITLE_HEIGHT));
-    m_media_play_ctrl->msw_rescale();
+    if (m_media_play_ctrl)
+        m_media_play_ctrl->msw_rescale();
     m_bpButton_xy->SetBitmap(m_bitmap_axis_home);
     m_bpButton_xy->SetMinSize(AXIS_MIN_SIZE);
     m_bpButton_xy->SetSize(AXIS_MIN_SIZE);

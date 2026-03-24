@@ -293,7 +293,7 @@ protected:
     ScalableBitmap m_bitmap_switch_camera;
 
     /* title panel */
-    wxPanel *       media_ctrl_panel;
+    wxPanel *       media_ctrl_panel{nullptr};
     wxPanel *       m_panel_monitoring_title;
     wxPanel *       m_panel_printing_title;
     wxPanel *       m_panel_control_title;
@@ -314,8 +314,8 @@ protected:
     wxStaticBitmap* m_camera_switch_button;
 
 
-    wxMediaCtrl2 *  m_media_ctrl;
-    MediaPlayCtrl * m_media_play_ctrl;
+    wxMediaCtrl2 *  m_media_ctrl{nullptr};
+    MediaPlayCtrl * m_media_play_ctrl{nullptr};
 
     Label *         m_staticText_printing;
     wxStaticBitmap *m_bitmap_thumbnail;
