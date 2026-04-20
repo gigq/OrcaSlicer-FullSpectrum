@@ -10,13 +10,18 @@ endif()
 if(NOT DEFINED BBL_INTERNAL_TESTING)
 set(BBL_INTERNAL_TESTING "0")
 endif()
-set(Snapmaker_VERSION "0.9.4")
+set(Snapmaker_VERSION "0.9.4.1")
 set(MIN_FIRM_VER "1.0.0")
-string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)"
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(\\.([0-9]+))?"
        Snapmaker_VERSION_MATCH ${Snapmaker_VERSION})
 set(ORCA_VERSION_MAJOR ${CMAKE_MATCH_1})
 set(ORCA_VERSION_MINOR ${CMAKE_MATCH_2})
 set(ORCA_VERSION_PATCH ${CMAKE_MATCH_3})
+if(CMAKE_MATCH_5)
+    set(ORCA_VERSION_TWEAK ${CMAKE_MATCH_5})
+else()
+    set(ORCA_VERSION_TWEAK 0)
+endif()
 
 set(SLIC3R_VERSION "01.10.01.50")
 

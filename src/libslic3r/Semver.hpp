@@ -4,6 +4,7 @@
 #include <string>
 #include <cstring>
 #include <ostream>
+#include <regex>
 #include <stdexcept>
 #include <boost/optional.hpp>
 #include <boost/format.hpp>
@@ -57,6 +58,19 @@ public:
 
 	static boost::optional<Semver> parse(const std::string &str)
 	{
+		static const std::regex snapmaker_version_regex(
+			R"(^([0-9]+)\.([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$)");
+		std::smatch match;
+		if (std::regex_match(str, match, snapmaker_version_regex)) {
+			Semver parsed(std::stoi(match[1].str()), std::stoi(match[2].str()),
+				std::stoi(match[3].str()) * (match[4].matched ? 100 : 1) + (match[4].matched ? std::stoi(match[4].str()) : 0));
+			if (match[5].matched)
+				parsed.set_prerelease(match[5].str().c_str());
+			if (match[6].matched)
+				parsed.set_metadata(match[6].str().c_str());
+			return parsed;
+		}
+
 		semver_t ver = semver_zero();
 		if (::semver_parse(str.c_str(), &ver) == 0) {
 			return Semver(ver);
