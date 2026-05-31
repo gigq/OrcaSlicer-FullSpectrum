@@ -99,12 +99,74 @@ void remove_duplicates_preserve_order(std::vector<unsigned int> &values)
     values = std::move(ordered);
 }
 
+unsigned int resolve_layer_mixed_1based(const LayerTools &layer_tools, unsigned int filament_id_1based)
+{
+    return resolve_mixed_with_layer_heights(layer_tools.mixed_mgr,
+                                            layer_tools.num_physical,
+                                            filament_id_1based,
+                                            layer_tools.layer_index,
+                                            float(layer_tools.print_z),
+                                            float(layer_tools.layer_height),
+                                            layer_tools.mixed_layer_height_a,
+                                            layer_tools.mixed_layer_height_b,
+                                            layer_tools.mixed_base_layer_height);
+}
+
+void normalize_zero_based_layer_extruders_to_physical(LayerTools &layer_tools)
+{
+    if (layer_tools.mixed_mgr == nullptr || layer_tools.num_physical == 0)
+        return;
+
+    bool changed = false;
+    for (unsigned int &extruder_id : layer_tools.extruders) {
+        if (extruder_id < layer_tools.num_physical)
+            continue;
+
+        const unsigned int resolved = resolve_layer_mixed_1based(layer_tools, extruder_id + 1);
+        if (resolved >= 1 && resolved <= layer_tools.num_physical) {
+            extruder_id = resolved - 1;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        if (layer_tools.preserve_extruder_order)
+            remove_duplicates_preserve_order(layer_tools.extruders);
+        else
+            sort_remove_duplicates(layer_tools.extruders);
+    }
+}
+
+bool can_use_wipe_volumes(const std::vector<unsigned int> &extruders,
+                          std::optional<unsigned int>      current_extruder_id,
+                          size_t                           wipe_volume_count)
+{
+    if (current_extruder_id && *current_extruder_id >= wipe_volume_count)
+        return false;
+
+    return std::all_of(extruders.begin(), extruders.end(), [wipe_volume_count](unsigned int extruder_id) {
+        return extruder_id < wipe_volume_count;
+    });
+}
+
 } // namespace
 
 
 // Shortest hamilton path problem
 static std::vector<unsigned int> solve_extruder_order(const std::vector<std::vector<float>>& wipe_volumes, std::vector<unsigned int> all_extruders, std::optional<unsigned int> start_extruder_id) 
 {
+    const size_t wipe_volume_count = wipe_volumes.size();
+    all_extruders.erase(std::remove_if(all_extruders.begin(), all_extruders.end(), [wipe_volume_count](unsigned int extruder_id) {
+        return extruder_id >= wipe_volume_count;
+    }), all_extruders.end());
+    remove_duplicates_preserve_order(all_extruders);
+
+    if (start_extruder_id && *start_extruder_id >= wipe_volume_count)
+        start_extruder_id.reset();
+
+    if (all_extruders.size() <= 1)
+        return all_extruders;
+
     bool add_start_extruder_flag = false;
 
     if (start_extruder_id) {
@@ -355,9 +417,12 @@ bool ToolOrdering::insert_wipe_tower_extruder()
     if (m_print_config_ptr->wipe_tower_filament != 0) {
         for (LayerTools& lt : m_layer_tools) {
             if (lt.wipe_tower_partitions > 0) {
-                lt.extruders.emplace_back(m_print_config_ptr->wipe_tower_filament - 1);
-                sort_remove_duplicates(lt.extruders);
-                changed = true;
+                const unsigned int wipe_tower_filament = resolve_layer_mixed_1based(lt, m_print_config_ptr->wipe_tower_filament);
+                if (wipe_tower_filament > 0) {
+                    lt.extruders.emplace_back(wipe_tower_filament - 1);
+                    sort_remove_duplicates(lt.extruders);
+                    changed = true;
+                }
             }
         }  
     }
@@ -504,8 +569,15 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
 
     for (auto object : print.objects()) {
         auto first_layer = object->get_layer(0);
+        if (first_layer == nullptr)
+            continue;
         for (auto layerm : first_layer->regions()) {
-            int extruder_id = layerm->region().config().option("wall_filament")->getInt();
+            unsigned int extruder_id = resolve_mixed(layerm->region().config().wall_filament.value,
+                                                     0,
+                                                     float(first_layer->print_z),
+                                                     float(first_layer->height));
+            if (extruder_id == 0)
+                continue;
             
             for (auto expoly : layerm->raw_slices) {
                 const double nozzle_diameter = print.config().nozzle_diameter.get_at(0);
@@ -550,8 +622,15 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
     int initial_extruder_id = -1;
     std::map<int, double> min_areas_per_extruder;
     auto first_layer = object.get_layer(0);
+    if (first_layer == nullptr)
+        return tool_order;
     for (auto layerm : first_layer->regions()) {
-        int extruder_id = layerm->region().config().option("wall_filament")->getInt();
+        unsigned int extruder_id = resolve_mixed(layerm->region().config().wall_filament.value,
+                                                 0,
+                                                 float(first_layer->print_z),
+                                                 float(first_layer->height));
+        if (extruder_id == 0)
+            continue;
         for (auto expoly : layerm->raw_slices) {
             const double nozzle_diameter = object.print()->config().nozzle_diameter.get_at(0);
             const coordf_t line_width = object.config().get_abs_value("line_width", nozzle_diameter);
@@ -1111,6 +1190,7 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume()
     std::optional<unsigned int> current_extruder_id;
     for (int i = 0; i < m_layer_tools.size(); ++i) {
         LayerTools& lt = m_layer_tools[i];
+        normalize_zero_based_layer_extruders_to_physical(lt);
         if (lt.extruders.empty())
             continue;
         if (lt.preserve_extruder_order) {
@@ -1136,6 +1216,11 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume()
 
         // The algorithm complexity is O(n2*2^n)
         if (i != 0) {
+            if (!can_use_wipe_volumes(lt.extruders, current_extruder_id, wipe_volumes.size())) {
+                current_extruder_id = lt.extruders.back();
+                continue;
+            }
+
             auto hash_key = extruders_to_hash_key(lt.extruders, current_extruder_id);
             auto iter = m_tool_order_cache.find(hash_key);
             if (iter == m_tool_order_cache.end()) {
